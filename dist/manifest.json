@@ -2,7 +2,7 @@
   "name": "Doom WAD Sender",
   "icon": "icon.png",
   "version": "0.1.0",
-  "description": "选择 wad 文件并发送到 Doom 接收器",
+  "description": "用于发送doom wad文件，请搭配快应用doom wad loader以及原生doom使用，传输时请确保手机插件界面以及手环接收器在前台运行，由于版权问题，wad文件请自行下载",
   "author": "IRKBI",
   "website": "",
   "entry": "doom_wad_sender_plugin.wasm",

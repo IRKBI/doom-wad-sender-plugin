@@ -1,0 +1,21 @@
+{
+  "name": "Doom WAD Sender",
+  "icon": "icon.png",
+  "version": "0.1.0",
+  "description": "选择 wad 文件并发送到 Doom 接收器",
+  "author": "",
+  "website": "",
+  "entry": "doom_wad_sender_plugin.wasm",
+  "wasi_version": 2,
+  "api_level": 2,
+  "permissions": [
+    "device",
+    "dialog",
+    "ui",
+    "thirdpartyapp",
+    "get_thirdparty_app_list",
+    "interconnect",
+    "register_interconnect_recv"
+  ],
+  "additional_files": []
+}

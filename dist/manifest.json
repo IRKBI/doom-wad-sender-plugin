@@ -3,7 +3,7 @@
   "icon": "icon.png",
   "version": "0.1.0",
   "description": "选择 wad 文件并发送到 Doom 接收器",
-  "author": "",
+  "author": "IRKBI",
   "website": "",
   "entry": "doom_wad_sender_plugin.wasm",
   "wasi_version": 2,

@@ -12,9 +12,37 @@ use std::sync::Mutex;
 
 // Doom 接收器快应用包名（与 doom1/src/manifest.json 的 package 一致）
 const PKG_NAME: &str = "com.doom.wadloader";
-// 与接收器 index.ux 的 CHUNK_SIZE 一致
-const CHUNK_SIZE: usize = 1536;
 const EVENT_SEND_WAD: &str = "doom_send_wad";
+const EVENT_SPEED_COMPAT: &str = "doom_speed_compat";
+const EVENT_SPEED_STANDARD: &str = "doom_speed_standard";
+const EVENT_SPEED_FAST: &str = "doom_speed_fast";
+const EVENT_RETRY: &str = "doom_retry";
+
+// 传输方式档位：块越大，往返次数越少，速度越快。
+// 接收器从 start_transfer.chunkSize 自动适配，无需两端硬编码一致。
+#[derive(Clone, Copy, PartialEq)]
+enum SpeedMode {
+    Compat,   // 兼容：1536B（最稳，最慢）
+    Standard, // 标准：8192B
+    Fast,     // 快速：16384B（推荐）
+}
+
+impl SpeedMode {
+    fn chunk_size(self) -> usize {
+        match self {
+            SpeedMode::Compat => 1536,
+            SpeedMode::Standard => 8192,
+            SpeedMode::Fast => 16384,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            SpeedMode::Compat => "兼容",
+            SpeedMode::Standard => "标准",
+            SpeedMode::Fast => "快速",
+        }
+    }
+}
 
 // ===== 全局状态 =====
 struct Transfer {
@@ -22,6 +50,7 @@ struct Transfer {
     data: Vec<u8>,
     next: usize,
     total: usize,
+    started: bool,
 }
 
 struct State {
@@ -29,6 +58,7 @@ struct State {
     status: String,
     transfer: Option<Transfer>,
     root: Option<String>,
+    speed: SpeedMode,
 }
 
 static S: Mutex<State> = Mutex::new(State {
@@ -36,11 +66,17 @@ static S: Mutex<State> = Mutex::new(State {
     status: String::new(),
     transfer: None,
     root: None,
+    speed: SpeedMode::Fast,
 });
 
 // ===== 工具 =====
 fn set_status(s: &str) {
     S.lock().unwrap().status = s.to_string();
+}
+
+fn set_speed(speed: SpeedMode) {
+    S.lock().unwrap().speed = speed;
+    rerender();
 }
 
 fn status_text() -> String {
@@ -80,8 +116,8 @@ fn send_json(addr: &str, obj: Value) -> bool {
     r.is_ok()
 }
 
-fn send_start(addr: &str, filename: &str, size: usize) -> bool {
-    send_json(addr, json!({"type": "start_transfer", "filename": filename, "size": size}))
+fn send_start(addr: &str, filename: &str, size: usize, chunk_size: usize, total: usize) -> bool {
+    send_json(addr, json!({"type": "start_transfer", "filename": filename, "size": size, "chunkSize": chunk_size, "total": total}))
 }
 
 fn send_chunk(addr: &str, index: usize, b64: &str) -> bool {
@@ -106,16 +142,20 @@ fn advance_transfer() {
 
     let action = {
         let mut st = S.lock().unwrap();
+        let cs = st.speed.chunk_size();
         let tr = match st.transfer.as_mut() {
             Some(t) => t,
             None => return,
         };
+        if !tr.started {
+            return; // 等接收器回 start_ack 确认断点
+        }
         if tr.next >= tr.total {
             st.transfer = None;
             Action::Done
         } else {
-            let start = tr.next * CHUNK_SIZE;
-            let end = (start + CHUNK_SIZE).min(tr.data.len());
+            let start = tr.next * cs;
+            let end = (start + cs).min(tr.data.len());
             let b64 = base64::engine::general_purpose::STANDARD.encode(&tr.data[start..end]);
             let idx = tr.next;
             tr.next += 1;
@@ -183,18 +223,60 @@ fn pick_and_send() {
         });
     }
 
-    // 4. 保存传输状态
-    let total = (size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    // 4. 保存传输状态（块大小随所选传输方式）
+    let cs = S.lock().unwrap().speed.chunk_size();
+    let total = (size + cs - 1) / cs;
     {
         let mut st = S.lock().unwrap();
         st.device_addr = Some(addr.clone());
-        st.transfer = Some(Transfer { filename: filename.clone(), data, next: 0, total });
-        st.status = format!("开始发送 {}（{} 块）", filename, total);
+        st.transfer = Some(Transfer { filename: filename.clone(), data, next: 0, total, started: false });
+        st.status = format!("开始发送 {}（{} 块，{}）", filename, total, st.speed.label());
     }
 
-    // 5. 发 start_transfer，然后发第一块
-    send_start(&addr, &filename, size);
-    advance_transfer();
+    // 5. 发 start_transfer（含块大小与总块数），等接收器回 start_ack 后再发块
+    send_start(&addr, &filename, size, cs, total);
+}
+
+fn retry_transfer() {
+    // 传输中断后重试：重新发 start_transfer，让接收器协商断点续传
+    let snapshot = {
+        let st = S.lock().unwrap();
+        match st.transfer.as_ref() {
+            Some(tr) => Some((st.device_addr.clone(), tr.filename.clone(), tr.data.len())),
+            None => None,
+        }
+    };
+
+    let (addr, filename, size) = match snapshot {
+        Some(t) => t,
+        None => {
+            set_status("当前无进行中的传输");
+            rerender();
+            return;
+        }
+    };
+    let addr = match addr {
+        Some(a) => a,
+        None => {
+            set_status("无已连接设备");
+            rerender();
+            return;
+        }
+    };
+
+    let cs = S.lock().unwrap().speed.chunk_size();
+    let total = (size + cs - 1) / cs;
+    {
+        let mut st = S.lock().unwrap();
+        if let Some(tr) = st.transfer.as_mut() {
+            tr.started = false;
+            tr.total = total;
+            tr.next = 0;
+        }
+        st.status = "重试：等待续传确认...".to_string();
+    }
+    send_start(&addr, &filename, size, cs, total);
+    rerender();
 }
 
 // ===== UI =====
@@ -214,8 +296,31 @@ fn button(content: &str, event_id: &str, color: &str) -> ui::Element {
         .width_full()
 }
 
+fn speed_button(content: &str, event_id: &str, active: bool) -> ui::Element {
+    let bg = if active { "#0D6EFF" } else { "#1A2230" };
+    ui::Element::new(ui::ElementType::Button, Some(content))
+        .on(ui::Event::Click, event_id)
+        .bg(bg)
+        .text_color("#FFFFFF")
+        .padding(8)
+        .radius(8)
+        .margin_right(8)
+        .size(13)
+}
+
 fn build_ui() -> ui::Element {
     let status = status_text();
+    let speed = S.lock().unwrap().speed;
+
+    let mut row = ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .flex_direction(ui::FlexDirection::Row)
+        .width_full()
+        .margin_top(6);
+    row = row.child(speed_button("兼容", EVENT_SPEED_COMPAT, speed == SpeedMode::Compat));
+    row = row.child(speed_button("标准", EVENT_SPEED_STANDARD, speed == SpeedMode::Standard));
+    row = row.child(speed_button("快速", EVENT_SPEED_FAST, speed == SpeedMode::Fast));
+
     ui::Element::new(ui::ElementType::Div, None)
         .flex()
         .flex_direction(ui::FlexDirection::Column)
@@ -225,7 +330,10 @@ fn build_ui() -> ui::Element {
         .child(text("Doom WAD 发送", 24, "#FFFFFF"))
         .child(text("选择 wad 文件发送到手表", 13, "#9AA6B8"))
         .child(text(&status, 13, "#8FB5FF"))
+        .child(text("传输方式", 12, "#9AA6B8").margin_top(8))
+        .child(row)
         .child(button("选择并发送 wad", EVENT_SEND_WAD, "#0D6EFF"))
+        .child(button("重试续传", EVENT_RETRY, "#1A2230"))
 }
 
 // ===== Guest 实现 =====
@@ -257,8 +365,28 @@ impl event::Guest for DoomWadSender {
         if matches!(event_type, EventType::InterconnectMessage) {
             let text = extract_payload_text(&event_payload);
             if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                if v.get("type").and_then(|x| x.as_str()) == Some("file_chunk_received") {
-                    advance_transfer();
+                match v.get("type").and_then(|x| x.as_str()) {
+                    Some("start_ack") => {
+                        // 接收器告知断点：从 chunkIndex 块继续
+                        let idx = v.get("chunkIndex").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                        {
+                            let mut st = S.lock().unwrap();
+                            if let Some(tr) = st.transfer.as_mut() {
+                                if idx <= tr.total {
+                                    tr.next = idx;
+                                    tr.started = true;
+                                    if idx > 0 {
+                                        st.status = format!("从第 {} 块续传", idx);
+                                    }
+                                }
+                            }
+                        }
+                        advance_transfer();
+                    }
+                    Some("file_chunk_received") => {
+                        advance_transfer();
+                    }
+                    _ => {}
                 }
             }
         }
@@ -274,10 +402,17 @@ impl event::Guest for DoomWadSender {
         _payload: String,
     ) -> FutureReader<String> {
         let (writer, reader) = astrobox_ng_wit::wit_future::new::<String>(|| "".to_string());
-        if event_id == EVENT_SEND_WAD
-            && matches!(event, event::Event::Click | event::Event::PointerUp)
-        {
+        let is_click = matches!(event, event::Event::Click | event::Event::PointerUp);
+        if event_id == EVENT_SEND_WAD && is_click {
             pick_and_send();
+        } else if event_id == EVENT_SPEED_COMPAT && is_click {
+            set_speed(SpeedMode::Compat);
+        } else if event_id == EVENT_SPEED_STANDARD && is_click {
+            set_speed(SpeedMode::Standard);
+        } else if event_id == EVENT_SPEED_FAST && is_click {
+            set_speed(SpeedMode::Fast);
+        } else if event_id == EVENT_RETRY && is_click {
+            retry_transfer();
         }
         astrobox_ng_wit::spawn(async move {
             let _ = writer.write("accepted".to_string()).await;
